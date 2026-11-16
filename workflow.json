@@ -1,0 +1,1881 @@
+{
+  "name": "n8n-hubspot-mapsly-territory-route-optimizer",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-site-visit-scheduled",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "0acf364e-982e-56da-a241-64cdb3f6e9fd",
+      "name": "HubSpot Site Visit Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000c3",
+      "notes": "HubSpot workflow 'Send a webhook' when a deal/ticket site visit is scheduled. Re-plans that service day. Pinned fictional fixtures included."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 18,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "95bc4085-2680-57de-8f6a-d096da02f048",
+      "name": "Nightly Plan for Tomorrow",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        420
+      ],
+      "notes": "Plans tomorrow's routes every evening (instance timezone)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Run Context & Authenticate     Mode: Run Once for All Items\n// Repo: n8n-hubspot-mapsly-territory-route-optimizer · dhRobin Systems\n// Webhook: a HubSpot workflow posts when a site visit is scheduled; the\n// whole service day is then (re-)planned. Schedule: plans tomorrow.\n// The webhook must carry the shared secret. Fails closed.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PLAN_TZ = (() => { const tz = env('PLANNING_TIMEZONE', 'UTC'); try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz; } catch (e) { return 'UTC'; } })();\nconst tzOffsetMs = (utcMs, tz) => {\n  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })\n    .formatToParts(new Date(utcMs)).filter((p) => p.type !== 'literal');\n  const p = Object.fromEntries(parts.map((x) => [x.type, Number(x.value)]));\n  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - utcMs;\n};\n// Local wall-clock time on a date (YYYY-MM-DD) in PLAN_TZ → UTC epoch ms\nconst localToUtc = (dateStr, minutesFromMidnight) => {\n  const [y, m, d] = dateStr.split('-').map(Number);\n  const guess = Date.UTC(y, m - 1, d, 0, 0) + minutesFromMidnight * 60000;\n  const off1 = tzOffsetMs(guess, PLAN_TZ);\n  let utc = guess - off1;\n  const off2 = tzOffsetMs(utc, PLAN_TZ);\n  if (off2 !== off1) utc = guess - off2;\n  return utc;\n};\nconst localDate = (utcMs) => new Intl.DateTimeFormat('en-CA', { timeZone: PLAN_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(utcMs));\nconst hhmmToMin = (v, fallback) => {\n  const m = String(v ?? '').trim().match(/^(\\d{1,2}):(\\d{2})$/);\n  if (!m) return fallback;\n  const n = Number(m[1]) * 60 + Number(m[2]);\n  return n >= 0 && n <= 24 * 60 ? n : fallback;\n};\nconst minToHhmm = (min) => { const r = Math.round(min); return `${String(Math.floor(r / 60)).padStart(2, '0')}:${String(r % 60).padStart(2, '0')}`; };\n\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst SECRET_HEADER = env('WEBHOOK_SECRET_HEADER', 'x-webhook-secret').toLowerCase();\nconst SANDBOX_FIXTURE_SECRET = 'sandbox-fictional-secret-not-for-production';\nconst EXPECTED_SECRET = env('WEBHOOK_SHARED_SECRET', '') || (SANDBOX_MODE ? SANDBOX_FIXTURE_SECRET : '');\nconst MAX_DAYS_AHEAD = Math.max(1, num('MAX_PLAN_DAYS_AHEAD', 30));\n\nconst safeEqual = (a, b) => {\n  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;\n  if (crypto) return crypto.timingSafeEqual(crypto.createHash('sha256').update(a).digest(), crypto.createHash('sha256').update(b).digest());\n  let diff = a.length ^ b.length;\n  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);\n  return diff === 0;\n};\n\nlet runId;\ntry { runId = 'route_' + crypto.randomUUID(); } catch (error) { runId = 'route_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10); }\n\nconst input = $input.first() ? $input.first().json : {};\nconst isWebhook = !!(input && input.headers && typeof input.headers === 'object');\nconst nowMs = Date.now();\nconst today = localDate(nowMs);\n\nconst toPlanDate = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const s = String(v).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  if (/^\\d{10,13}$/.test(s)) return new Date(Number(s.length === 10 ? Number(s) * 1000 : s)).toISOString().slice(0, 10); // HubSpot date = midnight UTC\n  const t = Date.parse(s);\n  return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : null;\n};\n\nconst run = {\n  runId,\n  startedAt: new Date(nowMs).toISOString(),\n  mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live',\n  sandboxMode: SANDBOX_MODE,\n  dryRun: DRY_RUN,\n  trigger: isWebhook ? 'webhook' : 'schedule',\n  timezone: PLAN_TZ,\n  hubspotApiBase: env('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com'),\n  accepted: true,\n  rejectReason: null,\n  planDate: null,\n  triggerRecord: null,\n};\n\nconst fixtures = SANDBOX_MODE && input && typeof input.sandboxFixtures === 'object' ? input.sandboxFixtures : null;\n\nif (isWebhook) {\n  const headers = {};\n  for (const [k, v] of Object.entries(input.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  if (!EXPECTED_SECRET) { run.accepted = false; run.rejectReason = 'shared_secret_not_configured'; }\n  else if (!safeEqual(headers[SECRET_HEADER] || '', EXPECTED_SECRET)) { run.accepted = false; run.rejectReason = 'shared_secret_mismatch'; }\n  else {\n    let body = input.body;\n    if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }\n    body = body && typeof body === 'object' ? body : {};\n    const props = body.properties && typeof body.properties === 'object' ? body.properties : body;\n    const val = (k) => (props[k] && typeof props[k] === 'object' && 'value' in props[k] ? props[k].value : props[k]);\n    run.triggerRecord = {\n      objectType: String(body.objectType || '').toLowerCase().includes('ticket') ? 'ticket' : 'deal',\n      objectId: body.objectId != null ? String(body.objectId) : body.hs_object_id != null ? String(body.hs_object_id) : null,\n    };\n    run.planDate = body.planDate === 'SANDBOX_TOMORROW' && SANDBOX_MODE ? localDate(nowMs + 86400000) : toPlanDate(body.planDate) || toPlanDate(val('site_visit_date'));\n    if (!run.planDate) { run.accepted = false; run.rejectReason = 'plan_date_missing'; }\n  }\n} else {\n  run.planDate = localDate(nowMs + 86400000);\n}\n\nif (run.accepted) {\n  const daysAhead = Math.round((Date.parse(run.planDate + 'T00:00:00Z') - Date.parse(today + 'T00:00:00Z')) / 86400000);\n  if (daysAhead < 0) { run.accepted = false; run.rejectReason = 'plan_date_in_past'; }\n  else if (daysAhead > MAX_DAYS_AHEAD) { run.accepted = false; run.rejectReason = 'plan_date_too_far_ahead'; }\n}\n\nreturn [{ json: { kind: run.accepted ? 'run' : 'rejected', run, sandboxFixtures: fixtures } }];\n"
+      },
+      "id": "d0669d8c-0403-5059-a227-fc9910e178ce",
+      "name": "Build Run Context & Authenticate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e90f877b-1b1a-501e-8354-d766a657265f",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "run",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e499be7-c263-5145-af91-d07b3f3203f1",
+      "name": "Request Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6a0d27dd-cb73-5b6f-a091-f3167eb0c6a1",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b988936a-1e71-54ca-8afc-9044955021a2",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Sandbox Visits                  Mode: Run Once for All Items\n// Emits fictional HubSpot deal/ticket records and a fictional technician\n// roster in the same shape as the live \"Collect HubSpot Visits\" node.\n// ─────────────────────────────────────────────────────────────────────\nconst { run, sandboxFixtures } = $input.first().json;\nif (!sandboxFixtures) {\n  return [{ json: { kind: 'raw', run, records: [], roster: [], source: 'sandbox_fixtures_missing', fetchErrors: ['sandbox fixtures missing: execute the pinned trigger'] } }];\n}\nreturn [{\n  json: {\n    kind: 'raw',\n    run,\n    source: 'sandbox_fixtures',\n    records: sandboxFixtures.visits || [],\n    roster: sandboxFixtures.technicians || [],\n    fetchErrors: [],\n    sandboxGeo: sandboxFixtures.geocodes || {},\n    sandboxPriorDispatch: sandboxFixtures.priorDispatch || [],\n  },\n}];\n"
+      },
+      "id": "fbd1c3df-68c2-5c46-9d2f-006fceb167a9",
+      "name": "Load Sandbox Visits",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/crm/v3/objects/deals/search",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20
+            }
+          },
+          "timeout": 15000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [ { propertyName: 'site_visit_date', operator: 'EQ', value: String(new Date($('Build Run Context & Authenticate').first().json.run.planDate + 'T00:00:00Z').getTime()) }, { propertyName: 'site_visit_status', operator: 'IN', values: ['scheduled', 'confirmed'] } ] }], properties: ['dealname', 'subject', 'site_visit_date', 'site_visit_status', 'site_visit_street', 'site_visit_city', 'site_visit_state', 'site_visit_postal_code', 'site_visit_country', 'site_visit_latitude', 'site_visit_longitude', 'site_visit_duration_minutes', 'site_visit_required_skills', 'site_visit_window_start', 'site_visit_window_end', 'site_visit_priority'], limit: 100 }) }}"
+      },
+      "id": "29a92d2c-02b4-554a-b271-8ffc2d6f63b8",
+      "name": "Search Scheduled Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Deals with site_visit_date = plan date and status scheduled/confirmed. Scope: crm.objects.deals.read."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/crm/v3/objects/tickets/search",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20
+            }
+          },
+          "timeout": 15000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [ { propertyName: 'site_visit_date', operator: 'EQ', value: String(new Date($('Build Run Context & Authenticate').first().json.run.planDate + 'T00:00:00Z').getTime()) }, { propertyName: 'site_visit_status', operator: 'IN', values: ['scheduled', 'confirmed'] } ] }], properties: ['dealname', 'subject', 'site_visit_date', 'site_visit_status', 'site_visit_street', 'site_visit_city', 'site_visit_state', 'site_visit_postal_code', 'site_visit_country', 'site_visit_latitude', 'site_visit_longitude', 'site_visit_duration_minutes', 'site_visit_required_skills', 'site_visit_window_start', 'site_visit_window_end', 'site_visit_priority'], limit: 100 }) }}"
+      },
+      "id": "b5c335cc-8ab3-5067-8fe1-b4c23067bb25",
+      "name": "Search Scheduled Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Scope: tickets."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Collect HubSpot Visits               Mode: Run Once for All Items\n// Merges the paginated deal and ticket searches for the plan date and\n// reads the technician roster from TECHNICIAN_ROSTER_JSON.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst run = $('Build Run Context & Authenticate').first().json.run;\nconst fetchErrors = [];\nconst records = [];\nconst clean = (s) => String(s || '').replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]').slice(0, 200);\n\nconst absorb = (pages, objectType) => {\n  for (const p of pages) {\n    const body = p.json || {};\n    if (body.error) { fetchErrors.push(`${objectType}s: ${clean(body.error.message || body.error)}`); continue; }\n    if (body.status === 'error') { fetchErrors.push(`${objectType}s: ${clean(body.category || body.message)}`); continue; }\n    for (const r of body.results || []) records.push({ objectType, id: String(r.id), properties: r.properties || {} });\n  }\n};\nabsorb($('Search Scheduled Deals').all(), 'deal');\nif (flag('INCLUDE_TICKETS', true)) absorb($input.all(), 'ticket');\n\nlet roster = [];\ntry {\n  const parsed = JSON.parse(env('TECHNICIAN_ROSTER_JSON', '[]'));\n  roster = Array.isArray(parsed) ? parsed : [];\n} catch (error) {\n  fetchErrors.push('TECHNICIAN_ROSTER_JSON is not valid JSON');\n}\n\nreturn [{ json: { kind: 'raw', run, source: 'hubspot_api', records, roster, fetchErrors } }];\n"
+      },
+      "id": "656c44f7-a7bc-5f72-984a-3726521c6645",
+      "name": "Collect HubSpot Visits",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Normalize Visits & Roster            Mode: Run Once for All Items\n// Turns HubSpot records into stops and the roster into technicians.\n// Records that can't be planned (missing address, cancelled) are kept as\n// pre-unassigned stops with a reason, so nothing disappears silently.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PLAN_TZ = (() => { const tz = env('PLANNING_TIMEZONE', 'UTC'); try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz; } catch (e) { return 'UTC'; } })();\nconst tzOffsetMs = (utcMs, tz) => {\n  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })\n    .formatToParts(new Date(utcMs)).filter((p) => p.type !== 'literal');\n  const p = Object.fromEntries(parts.map((x) => [x.type, Number(x.value)]));\n  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - utcMs;\n};\n// Local wall-clock time on a date (YYYY-MM-DD) in PLAN_TZ → UTC epoch ms\nconst localToUtc = (dateStr, minutesFromMidnight) => {\n  const [y, m, d] = dateStr.split('-').map(Number);\n  const guess = Date.UTC(y, m - 1, d, 0, 0) + minutesFromMidnight * 60000;\n  const off1 = tzOffsetMs(guess, PLAN_TZ);\n  let utc = guess - off1;\n  const off2 = tzOffsetMs(utc, PLAN_TZ);\n  if (off2 !== off1) utc = guess - off2;\n  return utc;\n};\nconst localDate = (utcMs) => new Intl.DateTimeFormat('en-CA', { timeZone: PLAN_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(utcMs));\nconst hhmmToMin = (v, fallback) => {\n  const m = String(v ?? '').trim().match(/^(\\d{1,2}):(\\d{2})$/);\n  if (!m) return fallback;\n  const n = Number(m[1]) * 60 + Number(m[2]);\n  return n >= 0 && n <= 24 * 60 ? n : fallback;\n};\nconst minToHhmm = (min) => { const r = Math.round(min); return `${String(Math.floor(r / 60)).padStart(2, '0')}:${String(r % 60).padStart(2, '0')}`; };\n\nconst src = $input.first().json;\nconst run = src.run;\nconst DEFAULT_DURATION = Math.max(5, num('DEFAULT_VISIT_MINUTES', 60));\nconst DEFAULT_WIN_START = hhmmToMin(env('DEFAULT_WINDOW_START', '08:00'), 480);\nconst DEFAULT_WIN_END = hhmmToMin(env('DEFAULT_WINDOW_END', '17:00'), 1020);\nconst MAX_STOPS = Math.max(1, num('MAX_STOPS_PER_RUN', 200));\nconst PLANNABLE = new Set(['scheduled', 'confirmed', '']);\n\nconst list = (v) => String(v ?? '').split(/[;,]/).map((s) => s.trim().toLowerCase()).filter(Boolean);\nconst numOrNull = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));\n\nconst stops = [];\nconst preUnassigned = [];\nfor (const r of (src.records || []).slice(0, MAX_STOPS)) {\n  const p = r.properties || {};\n  const status = String(p.site_visit_status || '').toLowerCase();\n  const address = [p.site_visit_street, p.site_visit_city, p.site_visit_state, p.site_visit_postal_code, p.site_visit_country].filter((x) => x && String(x).trim()).join(', ');\n  const lat = numOrNull(p.site_visit_latitude);\n  const lng = numOrNull(p.site_visit_longitude);\n  let winStart = hhmmToMin(p.site_visit_window_start, DEFAULT_WIN_START);\n  let winEnd = hhmmToMin(p.site_visit_window_end, DEFAULT_WIN_END);\n  if (winEnd <= winStart) { winStart = DEFAULT_WIN_START; winEnd = DEFAULT_WIN_END; }\n  const stop = {\n    stopId: `${r.objectType}:${r.id}`,\n    objectType: r.objectType,\n    recordId: r.id,\n    label: String((r.objectType === 'deal' ? p.dealname : p.subject) || `${r.objectType} ${r.id}`).slice(0, 120),\n    address,\n    city: p.site_visit_city || null,\n    lat: lat !== null && lng !== null ? lat : null,\n    lng: lat !== null && lng !== null ? lng : null,\n    preGeocoded: lat !== null && lng !== null,\n    skills: list(p.site_visit_required_skills),\n    durationMin: Math.max(5, numOrNull(p.site_visit_duration_minutes) ?? DEFAULT_DURATION),\n    windowStartMin: winStart,\n    windowEndMin: winEnd,\n    priority: ['high', 'normal', 'low'].includes(String(p.site_visit_priority || '').toLowerCase()) ? String(p.site_visit_priority).toLowerCase() : 'normal',\n    isTriggerRecord: !!(run.triggerRecord && run.triggerRecord.objectId === r.id),\n  };\n  if (!PLANNABLE.has(status)) { preUnassigned.push({ ...stop, reason: 'status_not_plannable', detail: status }); continue; }\n  if (!address && !stop.preGeocoded) { preUnassigned.push({ ...stop, reason: 'address_missing', detail: 'site_visit_street/city/postal code are empty' }); continue; }\n  stops.push(stop);\n}\n\nconst techs = [];\nconst rosterIssues = [];\nfor (const t of src.roster || []) {\n  if (!t || t.active === false) continue;\n  const start = t.start || {};\n  if (!t.id || !Number.isFinite(Number(start.lat)) || !Number.isFinite(Number(start.lng))) { rosterIssues.push(`technician ${t && t.id ? t.id : '?'} skipped: id and start.lat/lng are required`); continue; }\n  const end = t.end && Number.isFinite(Number(t.end.lat)) ? t.end : start;\n  const shiftStartMin = hhmmToMin(t.shiftStart, 480);\n  const shiftEndMin = hhmmToMin(t.shiftEnd, 1020);\n  if (shiftEndMin <= shiftStartMin) { rosterIssues.push(`technician ${t.id} skipped: shiftEnd must be after shiftStart`); continue; }\n  techs.push({\n    techId: String(t.id),\n    name: String(t.name || t.id).slice(0, 80),\n    skills: list(Array.isArray(t.skills) ? t.skills.join(';') : t.skills),\n    territories: (Array.isArray(t.territories) ? t.territories : list(t.territories)).map((x) => String(x).toLowerCase()),\n    start: { lat: Number(start.lat), lng: Number(start.lng), label: start.label || 'Start' },\n    end: { lat: Number(end.lat), lng: Number(end.lng), label: end.label || start.label || 'End' },\n    shiftStartMin,\n    shiftEndMin,\n    maxStops: Math.max(1, Number(t.maxStops) || 8),\n    connecteamUserId: t.connecteamUserId != null && t.connecteamUserId !== '' ? Number(t.connecteamUserId) : null,\n  });\n}\n\nif (stops.length === 0 || techs.length === 0) {\n  return [{\n    json: {\n      kind: 'nothing_to_plan', run,\n      reason: stops.length === 0 ? 'no_plannable_visits' : 'no_active_technicians',\n      preUnassigned, rosterIssues, fetchErrors: src.fetchErrors || [], visitCount: (src.records || []).length,\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    kind: 'plan_input',\n    run,\n    stops,\n    techs,\n    preUnassigned,\n    rosterIssues,\n    fetchErrors: src.fetchErrors || [],\n    sandboxGeo: src.sandboxGeo,\n    sandboxPriorDispatch: src.sandboxPriorDispatch,\n    geocodeRequest: {\n      requestId: run.runId,\n      planDate: run.planDate,\n      stops: stops.map((s) => (s.preGeocoded ? { stopId: s.stopId, lat: s.lat, lng: s.lng } : { stopId: s.stopId, address: s.address })),\n    },\n  },\n}];\n"
+      },
+      "id": "0b20857e-c902-596a-8e71-f0da725b7461",
+      "name": "Normalize Visits & Roster",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "be5dcdb2-1145-5ad7-b524-bc820d00b28b",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "plan_input",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3745695e-edf7-5c5a-a15a-0b35aec58ee4",
+      "name": "Visits to Plan?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1920,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2fe5443f-9aec-5fd1-ae5b-12d84960f7a5",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "18143305-a38e-541f-8a12-862ef6aa382b",
+      "name": "Sandbox Geocoding?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Mapsly Geocode & Territory  Mode: Run Once for All Items\n// Sandbox stand-in for the Mapsly custom API endpoint. Answers in the\n// same envelope a Mapsly sync endpoint uses: { code, data }.\n// ─────────────────────────────────────────────────────────────────────\nconst plan = $input.first().json;\nconst table = plan.sandboxGeo || {};\nconst results = plan.geocodeRequest.stops.map((s) => {\n  const hit = table[s.stopId];\n  if (!hit) return { stopId: s.stopId, matchQuality: 'none', lat: null, lng: null, territories: [] };\n  return { stopId: s.stopId, lat: s.lat ?? hit.lat, lng: s.lng ?? hit.lng, matchQuality: s.lat != null ? 'provided' : hit.matchQuality || 'street', formattedAddress: hit.formattedAddress || null, territories: hit.territories || [] };\n});\nreturn [{ json: { statusCode: 200, body: { code: 200, data: { requestId: plan.geocodeRequest.requestId, results } } } }];\n"
+      },
+      "id": "d24d0362-bd6d-5c0c-b9ea-6df18107ad1d",
+      "name": "Simulate Mapsly Geocode & Territory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ (() => { const u = $env.MAPSLY_GEO_ENDPOINT_URL || 'YOUR_MAPSLY_ENDPOINT_URL'; const k = $env.MAPSLY_API_KEY || ''; const p = $env.MAPSLY_API_KEY_PARAM || ''; return k && p ? u + (u.includes('?') ? '&' : '?') + encodeURIComponent(p) + '=' + encodeURIComponent(k) : u; })() }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 120000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geocodeRequest) }}"
+      },
+      "id": "897e4c6b-a9c5-55b1-aece-bbd3fc876f84",
+      "name": "Mapsly Geocode & Territory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Mapsly custom API endpoint (sync). Returns { code, data: { results: [{ stopId, lat, lng, matchQuality, territories }] } }."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Cluster Stops by Proximity           Mode: Run Once for All Items\n// 1. Merges Mapsly geocodes + territories into the stops (quality gate).\n// 2. Clusters stops: first by primary territory, then greedily by radius.\n// 3. Builds sparse travel-time pair requests for the Mapsly matrix\n//    endpoint (k nearest neighbours + technician start/end legs), batched.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst haversineKm = (a, b) => {\n  const R = 6371, toRad = (d) => (d * Math.PI) / 180;\n  const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);\n  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;\n  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));\n};\n// Straight-line → road estimate: detour factor plus a distance-banded average speed.\nconst ROAD_FACTOR = Math.max(1, num('FALLBACK_ROAD_FACTOR', 1.35));\nconst estimateLeg = (a, b) => {\n  const km = haversineKm(a, b) * ROAD_FACTOR;\n  const kmh = km < 5 ? num('FALLBACK_SPEED_URBAN_KMH', 30) : km < 25 ? num('FALLBACK_SPEED_SUBURBAN_KMH', 45) : num('FALLBACK_SPEED_HIGHWAY_KMH', 70);\n  return { durationSec: Math.round((km / Math.max(5, kmh)) * 3600), distanceMeters: Math.round(km * 1000) };\n};\n\nconst ctx = $('Visits to Plan?').first().json;\nconst resp = $input.first() ? $input.first().json : {};\nconst MIN_QUALITY = env('MIN_GEOCODE_QUALITY', 'street').toLowerCase();\nconst QUALITY = { provided: 5, rooftop: 4, street: 3, postal: 2, city: 1, none: 0 };\nconst RADIUS_KM = Math.max(0.5, num('CLUSTER_RADIUS_KM', 15));\nconst NEIGHBOURS = Math.max(2, num('MATRIX_NEIGHBORS', 8));\nconst PAIRS_PER_CALL = Math.max(10, num('MAPSLY_MAX_PAIRS_PER_CALL', 300));\n\n// ── 1 · Geocode merge ─────────────────────────────────────────────────\nconst statusCode = Number(resp.statusCode || 0);\nconst envelope = resp.body || {};\nconst payloadCode = Number(envelope.code || statusCode || 0);\nconst data = envelope.data || envelope;\nconst geoOk = statusCode === 200 && payloadCode < 400 && Array.isArray(data.results);\nconst byId = {};\nif (geoOk) for (const r of data.results) if (r && r.stopId) byId[String(r.stopId)] = r;\n\nconst stops = [];\nconst unassigned = [...(ctx.preUnassigned || [])];\nfor (const s of ctx.stops) {\n  const g = byId[s.stopId];\n  const territories = g && Array.isArray(g.territories) ? g.territories.map((t) => ({ id: String(t.id ?? t).toLowerCase(), name: t.name || String(t.id ?? t) })) : [];\n  if (s.preGeocoded) { stops.push({ ...s, territories, geocodeQuality: 'provided' }); continue; }\n  if (!geoOk) { unassigned.push({ ...s, reason: 'geocode_service_unavailable', detail: `Mapsly endpoint returned ${statusCode || 'network error'}` }); continue; }\n  const quality = String((g && g.matchQuality) || 'none').toLowerCase();\n  if (!g || !Number.isFinite(Number(g.lat)) || !Number.isFinite(Number(g.lng)) || (QUALITY[quality] ?? 0) < (QUALITY[MIN_QUALITY] ?? 3)) {\n    unassigned.push({ ...s, reason: 'geocode_low_quality', detail: `match quality \"${quality}\", minimum \"${MIN_QUALITY}\"` });\n    continue;\n  }\n  stops.push({ ...s, lat: Number(g.lat), lng: Number(g.lng), territories, geocodeQuality: quality, formattedAddress: g.formattedAddress || null });\n}\n\n// ── 2 · Clustering ────────────────────────────────────────────────────\nconst groups = {};\nfor (const s of stops) {\n  const key = s.territories.length ? s.territories[0].id : '__none__';\n  (groups[key] = groups[key] || []).push(s);\n}\nconst clusters = [];\nlet n = 0;\nfor (const [territory, members] of Object.entries(groups)) {\n  const pending = [...members].sort((a, b) => a.lat - b.lat || a.lng - b.lng);\n  while (pending.length) {\n    const seed = pending.shift();\n    const group = [seed];\n    for (let i = pending.length - 1; i >= 0; i--) {\n      if (haversineKm(seed, pending[i]) <= RADIUS_KM) group.push(pending.splice(i, 1)[0]);\n    }\n    const id = `C${++n}`;\n    const centroid = { lat: group.reduce((a, x) => a + x.lat, 0) / group.length, lng: group.reduce((a, x) => a + x.lng, 0) / group.length };\n    clusters.push({ clusterId: id, territory: territory === '__none__' ? null : territory, size: group.length, centroid, stopIds: group.map((x) => x.stopId) });\n    for (const x of group) x.clusterId = id;\n  }\n}\n\n// ── 3 · Sparse matrix pair requests ───────────────────────────────────\nconst points = [];\nconst pointIndex = {};\nconst addPoint = (id, lat, lng) => { if (!pointIndex[id]) { pointIndex[id] = true; points.push({ id, lat, lng }); } };\nfor (const s of stops) addPoint(s.stopId, s.lat, s.lng);\nfor (const t of ctx.techs) { addPoint(`tech:${t.techId}:start`, t.start.lat, t.start.lng); addPoint(`tech:${t.techId}:end`, t.end.lat, t.end.lng); }\n\nconst pairSet = new Set();\nconst addPair = (a, b) => { if (a !== b) pairSet.add(`${a}|${b}`); };\nfor (const s of stops) {\n  const near = stops.filter((o) => o.stopId !== s.stopId).map((o) => ({ o, d: haversineKm(s, o) })).sort((a, b) => a.d - b.d).slice(0, NEIGHBOURS);\n  for (const { o } of near) { addPair(s.stopId, o.stopId); addPair(o.stopId, s.stopId); }\n  for (const t of ctx.techs) {\n    if (!s.skills.every((k) => t.skills.includes(k))) continue; // only legs a technician could actually drive\n    addPair(`tech:${t.techId}:start`, s.stopId);\n    addPair(s.stopId, `tech:${t.techId}:end`);\n  }\n}\nconst pairs = [...pairSet].map((p) => p.split('|'));\nconst batches = [];\nfor (let i = 0; i < pairs.length; i += PAIRS_PER_CALL) batches.push(pairs.slice(i, i + PAIRS_PER_CALL));\nif (!batches.length) batches.push([]);\n\nconst plan = {\n  run: ctx.run,\n  stops,\n  techs: ctx.techs,\n  clusters,\n  unassigned,\n  rosterIssues: ctx.rosterIssues || [],\n  fetchErrors: ctx.fetchErrors || [],\n  geocode: { ok: geoOk, statusCode: statusCode || null, requested: ctx.stops.length, accepted: stops.length },\n  matrix: { points: points.length, pairsRequested: pairs.length, batches: batches.length },\n  sandboxPriorDispatch: ctx.sandboxPriorDispatch,\n};\n\nconst pointById = Object.fromEntries(points.map((p) => [p.id, p]));\nreturn batches.map((b, i) => {\n  const used = new Set(b.flat());\n  return {\n    json: {\n      kind: 'matrix_batch',\n      batchIndex: i,\n      batchCount: batches.length,\n      plan: i === 0 ? plan : null,\n      request: { requestId: `${ctx.run.runId}:${i}`, profile: env('MAPSLY_TRAVEL_PROFILE', 'driving'), points: [...used].map((id) => pointById[id]), pairs: b },\n    },\n  };\n});\n"
+      },
+      "id": "1a04d2b9-2509-59e2-b2a4-a7a03f60a1de",
+      "name": "Cluster Stops by Proximity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        160
+      ],
+      "notes": "Geocode quality gate · territory + radius clustering · sparse matrix pair batches."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c06eff72-6adc-53f6-a85b-3f3a75f072e3",
+              "leftValue": "={{ $('Build Run Context & Authenticate').first().json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "81d12310-a5d6-5cea-9763-45b99d79ec5f",
+      "name": "Sandbox Matrix?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2880,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Mapsly Distance Matrix      Mode: Run Once for All Items\n// Sandbox stand-in for the Mapsly travel-time endpoint. Returns road-like\n// estimates from straight-line distance, in the { code, data } envelope.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst haversineKm = (a, b) => {\n  const R = 6371, toRad = (d) => (d * Math.PI) / 180;\n  const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);\n  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;\n  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));\n};\n// Straight-line → road estimate: detour factor plus a distance-banded average speed.\nconst ROAD_FACTOR = Math.max(1, num('FALLBACK_ROAD_FACTOR', 1.35));\nconst estimateLeg = (a, b) => {\n  const km = haversineKm(a, b) * ROAD_FACTOR;\n  const kmh = km < 5 ? num('FALLBACK_SPEED_URBAN_KMH', 30) : km < 25 ? num('FALLBACK_SPEED_SUBURBAN_KMH', 45) : num('FALLBACK_SPEED_HIGHWAY_KMH', 70);\n  return { durationSec: Math.round((km / Math.max(5, kmh)) * 3600), distanceMeters: Math.round(km * 1000) };\n};\n\nreturn $input.all().map(({ json }) => {\n  const pts = Object.fromEntries(json.request.points.map((p) => [p.id, p]));\n  const legs = json.request.pairs.map(([from, to]) => ({ from, to, ...estimateLeg(pts[from], pts[to]) }));\n  return { json: { statusCode: 200, body: { code: 200, data: { requestId: json.request.requestId, legs, source: 'sandbox_simulated' } } } };\n});\n"
+      },
+      "id": "38b5c996-174d-574b-a436-6303ee71942f",
+      "name": "Simulate Mapsly Distance Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ (() => { const u = $env.MAPSLY_MATRIX_ENDPOINT_URL || 'YOUR_MAPSLY_ENDPOINT_URL'; const k = $env.MAPSLY_API_KEY || ''; const p = $env.MAPSLY_API_KEY_PARAM || ''; return k && p ? u + (u.includes('?') ? '&' : '?') + encodeURIComponent(p) + '=' + encodeURIComponent(k) : u; })() }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 300000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 300
+            }
+          }
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}"
+      },
+      "id": "b79c992c-6663-504b-b9cb-856a49564dc7",
+      "name": "Mapsly Distance Matrix",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Mapsly custom API endpoint (sync). Returns { code, data: { legs: [{ from, to, durationSec, distanceMeters }] } }."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Route & Schedule Optimization Engine Mode: Run Once for All Items\n// Inputs: clustered stops + technicians (from Cluster Stops by Proximity)\n//         and the Mapsly travel-time legs (one item per matrix batch).\n// Steps:  1 eligibility (skills, territory)   2 priority-ordered cheapest\n//         insertion with time windows, shift hours and stop caps\n//         3 intra-route 2-opt   4 inter-route relocate   5 schedule + KPIs\n// Output: one `route` item per technician + one `plan_summary` item.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst haversineKm = (a, b) => {\n  const R = 6371, toRad = (d) => (d * Math.PI) / 180;\n  const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);\n  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;\n  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));\n};\n// Straight-line → road estimate: detour factor plus a distance-banded average speed.\nconst ROAD_FACTOR = Math.max(1, num('FALLBACK_ROAD_FACTOR', 1.35));\nconst estimateLeg = (a, b) => {\n  const km = haversineKm(a, b) * ROAD_FACTOR;\n  const kmh = km < 5 ? num('FALLBACK_SPEED_URBAN_KMH', 30) : km < 25 ? num('FALLBACK_SPEED_SUBURBAN_KMH', 45) : num('FALLBACK_SPEED_HIGHWAY_KMH', 70);\n  return { durationSec: Math.round((km / Math.max(5, kmh)) * 3600), distanceMeters: Math.round(km * 1000) };\n};\nconst PLAN_TZ = (() => { const tz = env('PLANNING_TIMEZONE', 'UTC'); try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz; } catch (e) { return 'UTC'; } })();\nconst tzOffsetMs = (utcMs, tz) => {\n  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })\n    .formatToParts(new Date(utcMs)).filter((p) => p.type !== 'literal');\n  const p = Object.fromEntries(parts.map((x) => [x.type, Number(x.value)]));\n  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - utcMs;\n};\n// Local wall-clock time on a date (YYYY-MM-DD) in PLAN_TZ → UTC epoch ms\nconst localToUtc = (dateStr, minutesFromMidnight) => {\n  const [y, m, d] = dateStr.split('-').map(Number);\n  const guess = Date.UTC(y, m - 1, d, 0, 0) + minutesFromMidnight * 60000;\n  const off1 = tzOffsetMs(guess, PLAN_TZ);\n  let utc = guess - off1;\n  const off2 = tzOffsetMs(utc, PLAN_TZ);\n  if (off2 !== off1) utc = guess - off2;\n  return utc;\n};\nconst localDate = (utcMs) => new Intl.DateTimeFormat('en-CA', { timeZone: PLAN_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(utcMs));\nconst hhmmToMin = (v, fallback) => {\n  const m = String(v ?? '').trim().match(/^(\\d{1,2}):(\\d{2})$/);\n  if (!m) return fallback;\n  const n = Number(m[1]) * 60 + Number(m[2]);\n  return n >= 0 && n <= 24 * 60 ? n : fallback;\n};\nconst minToHhmm = (min) => { const r = Math.round(min); return `${String(Math.floor(r / 60)).padStart(2, '0')}:${String(r % 60).padStart(2, '0')}`; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst TERRITORY_MODE = ['strict', 'prefer', 'ignore'].includes(env('TERRITORY_MODE', 'prefer').toLowerCase()) ? env('TERRITORY_MODE', 'prefer').toLowerCase() : 'prefer';\nconst TERRITORY_PENALTY = Math.max(0, num('TERRITORY_MISMATCH_PENALTY_MIN', 30));\nconst BALANCE_WEIGHT = Math.max(0, num('LOAD_BALANCE_WEIGHT_MIN', 4));\nconst CLUSTER_BONUS = Math.max(0, num('CLUSTER_AFFINITY_BONUS_MIN', 5));\nconst WAIT_WEIGHT = Math.max(0, num('WAIT_TIME_WEIGHT', 0.25));\nconst OVERTIME_TOLERANCE = Math.max(0, num('SHIFT_OVERTIME_TOLERANCE_MIN', 0));\nconst LATE_RISK_SLACK = Math.max(0, num('LATE_RISK_SLACK_MIN', 15));\nconst MAX_LEG_MIN = Math.max(5, num('MAX_SINGLE_LEG_MINUTES', 120));\n\nconst plan = $('Cluster Stops by Proximity').first().json.plan;\nconst run = plan.run;\nconst nowMs = Date.now();\n\n// ── Travel-time lookup (Mapsly legs, else estimate) ───────────────────\nconst legs = {};\nlet legsReturned = 0;\nlet matrixFailures = 0;\nfor (const { json } of $input.all()) {\n  const ok = Number(json.statusCode) === 200 && json.body && Number(json.body.code || 200) < 400;\n  const data = json.body ? json.body.data || json.body : {};\n  if (!ok || !Array.isArray(data.legs)) { matrixFailures++; continue; }\n  for (const l of data.legs) {\n    if (!l || l.from == null || l.to == null || !Number.isFinite(Number(l.durationSec))) continue;\n    legs[`${l.from}|${l.to}`] = { sec: Number(l.durationSec), m: Number(l.distanceMeters) || 0, source: data.source || 'mapsly' };\n    legsReturned++;\n  }\n}\nconst coords = {};\nfor (const s of plan.stops) coords[s.stopId] = { lat: s.lat, lng: s.lng };\nfor (const t of plan.techs) { coords[`tech:${t.techId}:start`] = t.start; coords[`tech:${t.techId}:end`] = t.end; }\nconst estimatedKeys = new Set();\nconst travel = (a, b) => {\n  if (a === b) return { sec: 0, m: 0, source: 'same_point' };\n  const hit = legs[`${a}|${b}`];\n  if (hit) return hit;\n  estimatedKeys.add(`${a}|${b}`);\n  const e = estimateLeg(coords[a], coords[b]);\n  return { sec: e.durationSec, m: e.distanceMeters, source: 'estimated' };\n};\n\n// ── Route evaluation ──────────────────────────────────────────────────\nconst stopById = Object.fromEntries(plan.stops.map((s) => [s.stopId, s]));\nfunction evaluate(tech, seq) {\n  if (!seq.length) return { ok: true, cost: 0, drive: 0, dist: 0, wait: 0, finishMin: tech.shiftStartMin, schedule: [], returnLeg: { driveMin: 0, distanceM: 0, legSource: 'none' } };\n  let t = tech.shiftStartMin;\n  let pos = `tech:${tech.techId}:start`;\n  let drive = 0, dist = 0, wait = 0;\n  const schedule = [];\n  for (const s of seq) {\n    const leg = travel(pos, s.stopId);\n    const dMin = leg.sec / 60;\n    if (dMin > MAX_LEG_MIN) return { ok: false, reason: 'leg_too_long' };\n    const arrive = t + dMin;\n    const start = Math.max(arrive, s.windowStartMin);\n    if (start > s.windowEndMin) return { ok: false, reason: 'time_window' };\n    const end = start + s.durationMin;\n    schedule.push({ stopId: s.stopId, arriveMin: arrive, startMin: start, endMin: end, driveMin: dMin, distanceM: leg.m, waitMin: start - arrive, legSource: leg.source });\n    wait += start - arrive; drive += dMin; dist += leg.m; t = end; pos = s.stopId;\n  }\n  const back = travel(pos, `tech:${tech.techId}:end`);\n  t += back.sec / 60; drive += back.sec / 60; dist += back.m;\n  if (t > tech.shiftEndMin + OVERTIME_TOLERANCE) return { ok: false, reason: 'shift_end' };\n  return { ok: true, cost: drive + WAIT_WEIGHT * wait, drive, dist, wait, finishMin: t, schedule, returnLeg: { driveMin: back.sec / 60, distanceM: back.m, legSource: back.source } };\n}\n\n// ── 1 · Eligibility ───────────────────────────────────────────────────\nconst hasSkills = (tech, s) => s.skills.every((k) => tech.skills.includes(k));\nconst inTerritory = (tech, s) => s.territories.length === 0 || s.territories.some((t) => tech.territories.includes(t.id));\nconst penaltyFor = (tech, s) => (TERRITORY_MODE === 'prefer' && !inTerritory(tech, s) ? TERRITORY_PENALTY : 0);\nconst eligibleTechs = (s) => {\n  const bySkill = plan.techs.filter((t) => hasSkills(t, s));\n  if (!bySkill.length) return { techs: [], reason: 'no_tech_with_required_skills', detail: `needs ${s.skills.join(', ') || 'no skills'}` };\n  if (TERRITORY_MODE === 'strict') {\n    const byTerr = bySkill.filter((t) => inTerritory(t, s));\n    if (!byTerr.length) return { techs: [], reason: 'no_tech_in_territory', detail: `territories ${s.territories.map((t) => t.id).join(', ')}` };\n    return { techs: byTerr };\n  }\n  return { techs: bySkill };\n};\n\n// ── 2 · Cheapest insertion (priority first, tightest windows first) ───\nconst routes = Object.fromEntries(plan.techs.map((t) => [t.techId, []]));\nconst evals = Object.fromEntries(plan.techs.map((t) => [t.techId, evaluate(t, [])]));\nconst techById = Object.fromEntries(plan.techs.map((t) => [t.techId, t]));\nconst unassigned = [...plan.unassigned];\nconst PRIORITY = { high: 0, normal: 1, low: 2 };\nconst order = [...plan.stops].sort((a, b) =>\n  PRIORITY[a.priority] - PRIORITY[b.priority] || (a.windowEndMin - a.windowStartMin) - (b.windowEndMin - b.windowStartMin) || a.windowEndMin - b.windowEndMin || a.stopId.localeCompare(b.stopId));\n\nconst bestInsertion = (s, candidates, exclude) => {\n  let best = null;\n  const why = {};\n  for (const tech of candidates) {\n    if (exclude && tech.techId === exclude) continue;\n    const seq = routes[tech.techId];\n    if (seq.length >= tech.maxStops) { why.capacity_reached = (why.capacity_reached || 0) + 1; continue; }\n    for (let i = 0; i <= seq.length; i++) {\n      const trial = [...seq.slice(0, i), s, ...seq.slice(i)];\n      const ev = evaluate(tech, trial);\n      if (!ev.ok) { why[ev.reason] = (why[ev.reason] || 0) + 1; continue; }\n      const affinity = seq.some((x) => x.clusterId === s.clusterId) ? CLUSTER_BONUS : 0;\n      const delta = ev.cost - evals[tech.techId].cost + penaltyFor(tech, s) + BALANCE_WEIGHT * seq.length - affinity;\n      if (!best || delta < best.delta) best = { tech, index: i, ev, delta };\n    }\n  }\n  return { best, why };\n};\n\nfor (const s of order) {\n  const elig = eligibleTechs(s);\n  if (!elig.techs.length) { unassigned.push({ ...s, reason: elig.reason, detail: elig.detail }); continue; }\n  const { best, why } = bestInsertion(s, elig.techs);\n  if (!best) {\n    unassigned.push({ ...s, reason: 'no_feasible_time_slot', detail: Object.entries(why).map(([k, v]) => `${k} ×${v}`).join(', ') || 'no slot' });\n    continue;\n  }\n  routes[best.tech.techId].splice(best.index, 0, s);\n  evals[best.tech.techId] = best.ev;\n}\n\n// ── 3 · Intra-route 2-opt ─────────────────────────────────────────────\nlet twoOptMoves = 0;\nfor (const tech of plan.techs) {\n  let seq = routes[tech.techId];\n  let improved = true, guard = 0;\n  while (improved && guard++ < 50 && seq.length >= 3) {\n    improved = false;\n    for (let i = 0; i < seq.length - 1 && !improved; i++) {\n      for (let j = i + 1; j < seq.length && !improved; j++) {\n        const trial = [...seq.slice(0, i), ...seq.slice(i, j + 1).reverse(), ...seq.slice(j + 1)];\n        const ev = evaluate(tech, trial);\n        if (ev.ok && ev.cost < evals[tech.techId].cost - 0.5) { seq = trial; evals[tech.techId] = ev; improved = true; twoOptMoves++; }\n      }\n    }\n  }\n  routes[tech.techId] = seq;\n}\n\n// ── 4 · Inter-route relocate (one pass) ───────────────────────────────\nlet relocateMoves = 0;\nfor (const tech of plan.techs) {\n  for (const s of [...routes[tech.techId]]) {\n    const rest = routes[tech.techId].filter((x) => x.stopId !== s.stopId);\n    const evRest = evaluate(tech, rest);\n    if (!evRest.ok) continue;\n    const saving = evals[tech.techId].cost + penaltyFor(tech, s) - evRest.cost;\n    const { best } = bestInsertion(s, eligibleTechs(s).techs, tech.techId);\n    if (best && best.delta < saving - 1) {\n      routes[tech.techId] = rest; evals[tech.techId] = evRest;\n      routes[best.tech.techId].splice(best.index, 0, s); evals[best.tech.techId] = best.ev;\n      relocateMoves++;\n    }\n  }\n}\n\n// ── 5 · Schedules, KPIs, dispatch state ───────────────────────────────\nconst staticData = $getWorkflowStaticData('global');\nlet ledger;\nif (!SANDBOX_MODE && !DRY_RUN) {\n  staticData.hsRouteOptimizer = staticData.hsRouteOptimizer || { version: 1, dispatched: {} };\n  ledger = staticData.hsRouteOptimizer.dispatched;\n} else if (SANDBOX_MODE) {\n  ledger = {};\n  for (const p of plan.sandboxPriorDispatch || []) ledger[`${run.planDate}:${p.techId}`] = { fingerprint: p.fingerprint, shiftIds: p.shiftIds || [], at: nowMs - 3600000 };\n} else {\n  ledger = JSON.parse(JSON.stringify((staticData.hsRouteOptimizer && staticData.hsRouteOptimizer.dispatched) || {}));\n}\n\nconst baselineDrive = (tech, seq) => {\n  const naive = [...seq].sort((a, b) => a.windowStartMin - b.windowStartMin || a.label.localeCompare(b.label));\n  let pos = `tech:${tech.techId}:start`, total = 0;\n  for (const s of naive) { total += travel(pos, s.stopId).sec / 60; pos = s.stopId; }\n  return total + travel(pos, `tech:${tech.techId}:end`).sec / 60;\n};\nconst r1 = (v) => Math.round(v * 10) / 10;\n\nconst routeItems = [];\nfor (const tech of plan.techs) {\n  const seq = routes[tech.techId];\n  const ev = evals[tech.techId];\n  const stops = seq.map((s, i) => {\n    const sch = ev.schedule[i];\n    return {\n      seq: i + 1, stopId: s.stopId, objectType: s.objectType, recordId: s.recordId, label: s.label, address: s.formattedAddress || s.address, city: s.city,\n      lat: s.lat, lng: s.lng, clusterId: s.clusterId, territories: s.territories.map((t) => t.id), priority: s.priority, skills: s.skills,\n      eta: minToHhmm(sch.arriveMin), start: minToHhmm(sch.startMin), end: minToHhmm(sch.endMin), startMin: sch.startMin, endMin: sch.endMin,\n      window: `${minToHhmm(s.windowStartMin)}–${minToHhmm(s.windowEndMin)}`, durationMin: s.durationMin,\n      driveMinFromPrev: r1(sch.driveMin), distanceKmFromPrev: r1(sch.distanceM / 1000), waitMin: r1(sch.waitMin), legSource: sch.legSource,\n      lateRisk: s.windowEndMin - sch.startMin < LATE_RISK_SLACK,\n      territoryMismatch: s.territories.length > 0 && !inTerritory(tech, s),\n      outsideTerritories: s.territories.length === 0,\n    };\n  });\n  const serviceMin = seq.reduce((a, s) => a + s.durationMin, 0);\n  const base = seq.length ? baselineDrive(tech, seq) : 0;\n  const shiftLen = tech.shiftEndMin - tech.shiftStartMin;\n  const fingerprint = stops.map((s) => `${s.stopId}@${s.start}`).join(',');\n  const prior = ledger[`${run.planDate}:${tech.techId}`];\n  const dispatchAction = !stops.length ? 'no_stops' : !tech.connecteamUserId ? 'slack_only' : prior && prior.fingerprint === fingerprint ? 'unchanged' : prior ? 'changed_after_dispatch' : 'create';\n  routeItems.push({\n    json: {\n      kind: 'route', run, planDate: run.planDate,\n      tech: { techId: tech.techId, name: tech.name, connecteamUserId: tech.connecteamUserId, start: tech.start, end: tech.end, shift: `${minToHhmm(tech.shiftStartMin)}–${minToHhmm(tech.shiftEndMin)}` },\n      stops,\n      returnLeg: seq.length ? { driveMin: r1(ev.returnLeg.driveMin), distanceKm: r1(ev.returnLeg.distanceM / 1000), legSource: ev.returnLeg.legSource } : null,\n      totals: {\n        stops: seq.length, driveMin: Math.round(ev.drive), distanceKm: r1(ev.dist / 1000), serviceMin, waitMin: Math.round(ev.wait),\n        departAt: minToHhmm(tech.shiftStartMin), finishAt: seq.length ? minToHhmm(ev.finishMin) : null,\n        utilisationPct: seq.length ? Math.round(((serviceMin + ev.drive) / shiftLen) * 100) : 0,\n        baselineDriveMin: Math.round(base), savingsPct: base > 0 ? Math.max(0, Math.round(((base - ev.drive) / base) * 100)) : 0,\n      },\n      fingerprint,\n      dispatchAction,\n      priorShiftIds: prior ? prior.shiftIds || [] : [],\n    },\n  });\n}\n\n// ── Plan summary & alerts ─────────────────────────────────────────────\nconst assignedCount = routeItems.reduce((a, r) => a + r.json.stops.length, 0);\nconst allStops = routeItems.flatMap((r) => r.json.stops.map((s) => ({ ...s, techName: r.json.tech.name })));\nconst alerts = [];\nconst push = (severity, code, message) => alerts.push({ severity, code, message });\nfor (const e of plan.fetchErrors) push('critical', 'hubspot_fetch_failed', e);\nif (!plan.geocode.ok) push('critical', 'geocode_service_unavailable', `Mapsly geocode endpoint returned ${plan.geocode.statusCode || 'network error'}`);\nif (matrixFailures) push('warning', 'matrix_batches_failed', `${matrixFailures} of ${plan.matrix.batches} travel-time batches failed; estimates used`);\nif (estimatedKeys.size && !SANDBOX_MODE) push('warning', 'estimated_travel_times', `${estimatedKeys.size} legs used straight-line estimates`);\nconst highUnassigned = unassigned.filter((u) => u.priority === 'high');\nif (highUnassigned.length) push('critical', 'high_priority_unassigned', `${highUnassigned.length} high-priority visit(s) could not be scheduled`);\nif (unassigned.length) push('warning', 'visits_unassigned', `${unassigned.length} visit(s) unassigned`);\nconst late = allStops.filter((s) => s.lateRisk);\nif (late.length) push('warning', 'late_risk', `${late.length} stop(s) start within ${LATE_RISK_SLACK} min of the window end`);\nconst mismatch = allStops.filter((s) => s.territoryMismatch);\nif (mismatch.length) push('info', 'territory_mismatch', `${mismatch.length} stop(s) served outside the technician's territory`);\nconst changed = routeItems.filter((r) => r.json.dispatchAction === 'changed_after_dispatch');\nif (changed.length) push('warning', 'route_changed_after_dispatch', `${changed.map((r) => r.json.tech.name).join(', ')}: route changed after shifts were dispatched; update Connecteam manually`);\nfor (const r of plan.rosterIssues) push('warning', 'roster_issue', r);\n\nconst severity = alerts.some((a) => a.severity === 'critical') ? 'critical' : alerts.some((a) => a.severity === 'warning') ? 'warning' : 'ok';\nconst totalDrive = routeItems.reduce((a, r) => a + r.json.totals.driveMin, 0);\nconst totalBase = routeItems.reduce((a, r) => a + r.json.totals.baselineDriveMin, 0);\n\nconst summary = {\n  kind: 'plan_summary', run, planDate: run.planDate, severity,\n  totals: {\n    visits: plan.stops.length + plan.unassigned.length, plannable: plan.stops.length, assigned: assignedCount, unassigned: unassigned.length,\n    techniciansUsed: routeItems.filter((r) => r.json.stops.length).length, techniciansAvailable: plan.techs.length,\n    driveMin: totalDrive, distanceKm: r1(routeItems.reduce((a, r) => a + r.json.totals.distanceKm, 0)),\n    baselineDriveMin: totalBase, savingsPct: totalBase > 0 ? Math.max(0, Math.round(((totalBase - totalDrive) / totalBase) * 100)) : 0,\n  },\n  routes: routeItems.map((r) => ({ techId: r.json.tech.techId, name: r.json.tech.name, stops: r.json.stops.length, driveMin: r.json.totals.driveMin, finishAt: r.json.totals.finishAt, dispatchAction: r.json.dispatchAction })),\n  unassigned: unassigned.map((u) => ({ stopId: u.stopId, objectType: u.objectType, recordId: u.recordId, label: u.label, city: u.city || null, priority: u.priority, reason: u.reason, detail: u.detail || null })),\n  alerts,\n  clusters: plan.clusters.map((c) => ({ clusterId: c.clusterId, territory: c.territory, size: c.size })),\n  geocode: plan.geocode,\n  matrix: { ...plan.matrix, legsReturned, matrixFailures, estimatedLegsUsed: estimatedKeys.size },\n  optimizer: { territoryMode: TERRITORY_MODE, twoOptMoves, relocateMoves },\n};\n\nreturn [...routeItems, { json: summary }];\n"
+      },
+      "id": "05b48575-3fc9-56c1-b876-b1d522fea11a",
+      "name": "Route & Schedule Optimization Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        160
+      ],
+      "notes": "Skills/territory eligibility · priority-ordered cheapest insertion with time windows · 2-opt · relocate · KPIs."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Dispatch Payloads              Mode: Run Once for All Items\n// Field Dispatch & Notification Router:\n//   • one Connecteam shift batch per technician route (one shift per stop,\n//     with address/GPS and route notes), only for routes not yet dispatched\n//   • one Slack Block Kit plan summary + operational alerts for dispatchers\n// Every item gets `route`: connecteam_live | slack_live | simulate\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst PLAN_TZ = (() => { const tz = env('PLANNING_TIMEZONE', 'UTC'); try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz; } catch (e) { return 'UTC'; } })();\nconst tzOffsetMs = (utcMs, tz) => {\n  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })\n    .formatToParts(new Date(utcMs)).filter((p) => p.type !== 'literal');\n  const p = Object.fromEntries(parts.map((x) => [x.type, Number(x.value)]));\n  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - utcMs;\n};\n// Local wall-clock time on a date (YYYY-MM-DD) in PLAN_TZ → UTC epoch ms\nconst localToUtc = (dateStr, minutesFromMidnight) => {\n  const [y, m, d] = dateStr.split('-').map(Number);\n  const guess = Date.UTC(y, m - 1, d, 0, 0) + minutesFromMidnight * 60000;\n  const off1 = tzOffsetMs(guess, PLAN_TZ);\n  let utc = guess - off1;\n  const off2 = tzOffsetMs(utc, PLAN_TZ);\n  if (off2 !== off1) utc = guess - off2;\n  return utc;\n};\nconst localDate = (utcMs) => new Intl.DateTimeFormat('en-CA', { timeZone: PLAN_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(utcMs));\nconst hhmmToMin = (v, fallback) => {\n  const m = String(v ?? '').trim().match(/^(\\d{1,2}):(\\d{2})$/);\n  if (!m) return fallback;\n  const n = Number(m[1]) * 60 + Number(m[2]);\n  return n >= 0 && n <= 24 * 60 ? n : fallback;\n};\nconst minToHhmm = (min) => { const r = Math.round(min); return `${String(Math.floor(r / 60)).padStart(2, '0')}:${String(r % 60).padStart(2, '0')}`; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst LIVE = !SANDBOX_MODE && !DRY_RUN;\nconst CONNECTEAM_ENABLED = flag('CONNECTEAM_ENABLED', true);\nconst SLACK_ENABLED = flag('SLACK_ENABLED', true);\nconst PUBLISH = flag('CONNECTEAM_PUBLISH_SHIFTS', false); // drafts by default: a dispatcher reviews first\nconst SCHEDULER_ID = env('CONNECTEAM_SCHEDULER_ID', '');\nconst JOB_ID = env('CONNECTEAM_JOB_ID', '');\nconst INCLUDE_LINK = flag('CONNECTEAM_INCLUDE_HUBSPOT_LINK', false);\nconst NOTIFY_ON_EMPTY = flag('NOTIFY_ON_EMPTY_PLAN', false);\nconst PORTAL = env('HUBSPOT_PORTAL_ID', 'YOUR_HUBSPOT_PORTAL_ID');\nconst APP = env('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, '');\nconst MENTION = env('SLACK_MENTION_ON_CRITICAL', '');\n\nconst items = $input.all().map((i) => i.json);\nconst html = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst recordLink = (objectType, id) => `${APP}/contacts/${encodeURIComponent(PORTAL)}/record/${objectType === 'ticket' ? '0-5' : '0-3'}/${encodeURIComponent(id)}`;\nconst REASON = {\n  no_tech_with_required_skills: 'no technician has the required skills',\n  no_tech_in_territory: 'no technician covers this territory',\n  no_feasible_time_slot: 'no slot fits the time window and shift hours',\n  geocode_low_quality: 'address could not be geocoded precisely',\n  geocode_service_unavailable: 'geocoding service unavailable',\n  address_missing: 'address missing',\n  status_not_plannable: 'visit status is not schedulable',\n};\n\nconst connecteamDelivery = !CONNECTEAM_ENABLED ? 'disabled' : !LIVE ? 'dry_run' : env('CONNECTEAM_API_TOKEN', '') && SCHEDULER_ID ? 'live' : 'not_configured';\nconst slackDelivery = !SLACK_ENABLED ? 'disabled' : !LIVE ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\n\nconst out = [];\n\n// ── Nothing to plan ───────────────────────────────────────────────────\nconst empty = items.find((i) => i.kind === 'nothing_to_plan');\nif (empty) {\n  const problems = [...(empty.fetchErrors || []), ...(empty.rosterIssues || [])];\n  const alert = problems.length > 0 || empty.reason === 'no_active_technicians';\n  if (alert || NOTIFY_ON_EMPTY) {\n    const blocks = [\n      { type: 'header', text: { type: 'plain_text', text: `${alert ? '🟠' : '⚪'} Route plan · ${empty.run.planDate} · nothing planned`, emoji: true } },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Reason:* ${esc(empty.reason.replace(/_/g, ' '))} · ${empty.visitCount} visit record(s) found${(empty.preUnassigned || []).length ? `, ${empty.preUnassigned.length} not plannable` : ''}` } },\n    ];\n    if (problems.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Problems*\\n${problems.slice(0, 10).map((p) => `• ${esc(p)}`).join('\\n')}` } });\n    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Run \\`${esc(empty.run.runId)}\\` · mode ${esc(empty.run.mode)}` }] });\n    out.push({ json: { kind: 'slack_summary', run: empty.run, planDate: empty.run.planDate, severity: alert ? 'warning' : 'ok', delivery: slackDelivery, route: slackDelivery === 'live' ? 'slack_live' : 'simulate', slackMessage: { text: `Route plan ${empty.run.planDate}: nothing planned (${empty.reason})`, blocks } } });\n  } else {\n    out.push({ json: { kind: 'plan_skipped', run: empty.run, planDate: empty.run.planDate, reason: empty.reason, route: 'simulate', delivery: 'none' } });\n  }\n  return out;\n}\n\nconst summary = items.find((i) => i.kind === 'plan_summary');\nconst routes = items.filter((i) => i.kind === 'route');\nconst run = summary.run;\n\n// ── Connecteam shift batches ──────────────────────────────────────────\nfor (const r of routes) {\n  const base = { run, planDate: r.planDate, tech: { techId: r.tech.techId, name: r.tech.name, connecteamUserId: r.tech.connecteamUserId }, totals: r.totals, fingerprint: r.fingerprint, dispatchAction: r.dispatchAction };\n  if (r.dispatchAction !== 'create') { out.push({ json: { kind: 'route_audit', ...base, route: 'simulate', delivery: 'none' } }); continue; }\n  const n = r.stops.length;\n  const shifts = r.stops.map((s) => {\n    const notes = [\n      `<p><b>Stop ${s.seq} of ${n}</b> · arrival window ${html(s.window)} · ETA ${html(s.eta)}</p>`,\n      `<p>Drive ${html(s.driveMinFromPrev)} min (${html(s.distanceKmFromPrev)} km) from the ${s.seq === 1 ? 'start location' : 'previous stop'}${s.waitMin > 0 ? ` · ${html(s.waitMin)} min wait before the window opens` : ''}</p>`,\n      `<p>HubSpot ${html(s.objectType)} ${html(s.recordId)}${s.skills.length ? ` · skills: ${html(s.skills.join(', '))}` : ''}${s.priority === 'high' ? ' · <b>HIGH PRIORITY</b>' : ''}</p>`,\n    ];\n    if (INCLUDE_LINK) notes.push(`<p><a href=\"${html(recordLink(s.objectType, s.recordId))}\">Open in HubSpot</a></p>`);\n    const shift = {\n      startTime: Math.floor(localToUtc(r.planDate, Math.round(s.startMin)) / 1000),\n      endTime: Math.floor(localToUtc(r.planDate, Math.round(s.startMin) + s.durationMin) / 1000),\n      timezone: PLAN_TZ,\n      title: `#${s.seq} ${s.label}`.slice(0, 100),\n      isPublished: PUBLISH,\n      assignedUserIds: [r.tech.connecteamUserId],\n      locationData: { isReferencedToJob: false, gps: { address: String(s.address || '').slice(0, 250), latitude: s.lat, longitude: s.lng } },\n      notes: [{ html: notes.join('') }],\n    };\n    if (JOB_ID) shift.jobId = JOB_ID;\n    return shift;\n  });\n  out.push({\n    json: {\n      kind: 'connecteam_request', ...base,\n      delivery: connecteamDelivery,\n      route: connecteamDelivery === 'live' ? 'connecteam_live' : 'simulate',\n      request: { schedulerId: SCHEDULER_ID || 'YOUR_CONNECTEAM_SCHEDULER_ID', notifyUsers: PUBLISH, body: shifts },\n    },\n  });\n}\n\n// ── Slack plan summary ────────────────────────────────────────────────\nconst t = summary.totals;\nconst icon = summary.severity === 'critical' ? '🔴' : summary.severity === 'warning' ? '🟠' : '🟢';\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: `${icon} Route plan · ${summary.planDate}`, emoji: true } },\n];\nif (summary.severity === 'critical' && MENTION) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${MENTION} dispatch needs attention` } });\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `*Visits assigned*\\n${t.assigned} of ${t.plannable} plannable (${t.visits} total)` },\n    { type: 'mrkdwn', text: `*Technicians*\\n${t.techniciansUsed} of ${t.techniciansAvailable} used` },\n    { type: 'mrkdwn', text: `*Total drive*\\n${Math.floor(t.driveMin / 60)} h ${t.driveMin % 60} min · ${t.distanceKm} km` },\n    { type: 'mrkdwn', text: `*vs. naive order*\\n${t.savingsPct}% less driving (${t.baselineDriveMin} → ${t.driveMin} min)` },\n  ],\n});\nblocks.push({ type: 'divider' });\nconst ACTION = { create: connecteamDelivery === 'live' ? '📲 sent to Connecteam' : `📲 Connecteam (${connecteamDelivery})`, unchanged: '✔︎ already dispatched, unchanged', changed_after_dispatch: '⚠️ changed after dispatch: update Connecteam', slack_only: '💬 Slack only (no Connecteam user)', no_stops: '— no stops' };\nfor (const r of routes) {\n  if (!r.stops.length) continue;\n  const lines = r.stops.slice(0, 10).map((s) => `${s.seq}. \\`${s.start}\\` <${recordLink(s.objectType, s.recordId)}|${esc(s.label)}> · ${esc(s.city || '')}${s.priority === 'high' ? ' · *high*' : ''}${s.lateRisk ? ' · ⏱️ tight' : ''}${s.territoryMismatch ? ' · ↔︎ out of territory' : ''}`);\n  if (r.stops.length > 10) lines.push(`…and ${r.stops.length - 10} more`);\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*${esc(r.tech.name)}* · ${r.totals.stops} stop${r.totals.stops === 1 ? '' : 's'} · ${r.totals.departAt}–${r.totals.finishAt} · ${r.totals.driveMin} min drive · ${r.totals.utilisationPct}% utilised\\n_${ACTION[r.dispatchAction] || r.dispatchAction}_\\n${lines.join('\\n')}`.slice(0, 2900) },\n  });\n}\nif (summary.unassigned.length) {\n  const lines = summary.unassigned.slice(0, 12).map((u) => `• <${recordLink(u.objectType, u.recordId)}|${esc(u.label)}>${u.priority === 'high' ? ' *(high)*' : ''}: ${esc(REASON[u.reason] || u.reason)}${u.detail ? ` _(${esc(u.detail)})_` : ''}`);\n  if (summary.unassigned.length > 12) lines.push(`…and ${summary.unassigned.length - 12} more`);\n  blocks.push({ type: 'divider' });\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Unassigned visits (${summary.unassigned.length})*\\n${lines.join('\\n')}`.slice(0, 2900) } });\n}\nconst shownAlerts = summary.alerts.filter((a) => a.severity !== 'info' || summary.alerts.length < 6);\nif (shownAlerts.length) {\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: shownAlerts.slice(0, 8).map((a) => `${a.severity === 'critical' ? '🔴' : a.severity === 'warning' ? '🟠' : 'ℹ️'} ${esc(a.message)}`).join('\\n').slice(0, 2900) }] });\n}\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Run \\`${esc(run.runId)}\\` · ${esc(run.trigger)} · mode ${esc(run.mode)} · ${esc(summary.clusters.length)} clusters · travel legs: ${esc(summary.matrix.legsReturned)} Mapsly, ${esc(summary.matrix.estimatedLegsUsed)} estimated · n8n-hubspot-mapsly-territory-route-optimizer` }] });\n\nout.push({\n  json: {\n    kind: 'slack_summary', run, planDate: summary.planDate, severity: summary.severity, totals: t, alerts: summary.alerts,\n    unassignedCount: summary.unassigned.length, unassignedReasons: summary.unassigned.map((u) => u.reason), optimizer: summary.optimizer, matrix: summary.matrix, geocode: summary.geocode,\n    delivery: slackDelivery, route: slackDelivery === 'live' ? 'slack_live' : 'simulate',\n    slackMessage: { text: `Route plan ${summary.planDate}: ${t.assigned}/${t.plannable} visits assigned, ${t.unassigned} unassigned, ${t.driveMin} min total drive.`, blocks: blocks.slice(0, 50) },\n  },\n});\n\nreturn out;\n"
+      },
+      "id": "6cb6e7ae-9503-5d95-a8ee-b615fe60709c",
+      "name": "Build Dispatch Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        240
+      ],
+      "notes": "Connecteam shift batches + Slack Block Kit summary."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "19114177-77ef-52fc-a986-1837099a6761",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "connecteam_live",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "connecteam_live"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8e82b5b6-7f4b-59a9-86d4-2b50de77a753",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "slack_live",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "slack_live"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "simulate_or_audit"
+        }
+      },
+      "id": "2c4d9081-1183-5585-baad-b4daebd65987",
+      "name": "Route Dispatch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3840,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.CONNECTEAM_API_BASE_URL || 'https://api.connecteam.com') }}/scheduler/v1/schedulers/{{ encodeURIComponent($json.request.schedulerId) }}/shifts",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        },
+        "method": "POST",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "notifyUsers",
+              "value": "={{ $json.request.notifyUsers }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $env.CONNECTEAM_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request.body) }}"
+      },
+      "id": "47620d7a-d1f2-5903-a8a9-7ee0f70425e0",
+      "name": "Create Connecteam Shifts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        60
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Scheduler API v1. Not retried automatically: a retry after a timeout could duplicate shifts."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Connecteam Result             Mode: Run Once for Each Item\n// The create call is never retried automatically (a retry after a timeout\n// could create duplicate shifts). Success stores the shift IDs and route\n// fingerprint, so a re-plan doesn't dispatch the same route twice.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'MAPSLY_API_KEY', 'MAPSLY_GEO_ENDPOINT_URL', 'MAPSLY_MATRIX_ENDPOINT_URL', 'CONNECTEAM_API_TOKEN', 'SLACK_WEBHOOK_URL', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url|endpoint[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/https?:\\/\\/[^\\s\"']*mapsly\\.com[^\\s\"']*/gi, '[REDACTED_MAPSLY_URL]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst ctx = $('Route Dispatch').item.json;\nconst res = $json || {};\nconst status = Number(res.statusCode || 0);\nconst shifts = res.body && res.body.data && Array.isArray(res.body.data.shifts) ? res.body.data.shifts : [];\nconst ok = status >= 200 && status < 300 && shifts.length > 0;\n\nif (ok) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    store.hsRouteOptimizer = store.hsRouteOptimizer || { version: 1, dispatched: {} };\n    store.hsRouteOptimizer.dispatched[`${ctx.planDate}:${ctx.tech.techId}`] = { fingerprint: ctx.fingerprint, shiftIds: shifts.map((s) => String(s.id)), at: Date.now() };\n    // keep the ledger small: drop plan dates older than 14 days\n    const cutoff = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);\n    for (const key of Object.keys(store.hsRouteOptimizer.dispatched)) if (key.slice(0, 10) < cutoff) delete store.hsRouteOptimizer.dispatched[key];\n  } catch (error) { /* ledger is best effort; the shifts exist either way */ }\n}\n\nconst message = ok ? null : redactString((res.body && (res.body.message || res.body.detail || JSON.stringify(res.body).slice(0, 200))) || (res.error && (res.error.message || res.error)) || 'connecteam_request_failed').slice(0, 300);\n\nreturn {\n  json: {\n    ...ctx,\n    request: { schedulerId: ctx.request.schedulerId, shiftCount: ctx.request.body.length, notifyUsers: ctx.request.notifyUsers },\n    dispatchResult: {\n      channel: 'connecteam', simulated: false, mode: 'live', ok, statusCode: status || null,\n      shiftIds: shifts.map((s) => String(s.id)), requestId: res.body && res.body.requestId ? String(res.body.requestId) : null,\n      message, hint: status === 401 || status === 403 ? 'check CONNECTEAM_API_TOKEN' : status === 400 ? 'check that connecteamUserId is assigned to the scheduler' : null,\n    },\n  },\n};\n"
+      },
+      "id": "3df73234-841e-5e5b-bf0e-27389ec3700e",
+      "name": "Record Connecteam Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "c6083be7-809b-50ed-9cee-849a75fa216f",
+      "name": "Post Slack Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        240
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery               Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Route Dispatch').item.json;\nreturn { json: { ...ctx, slackMessage: { blockCount: ctx.slackMessage.blocks.length }, dispatchResult: { channel: 'slack', simulated: false, mode: 'live', ok: true, at: new Date().toISOString() } } };\n"
+      },
+      "id": "1fb2b7e5-418e-5d0e-a108-567d5a00b65e",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                 Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'MAPSLY_API_KEY', 'MAPSLY_GEO_ENDPOINT_URL', 'MAPSLY_MATRIX_ENDPOINT_URL', 'CONNECTEAM_API_TOKEN', 'SLACK_WEBHOOK_URL', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url|endpoint[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/https?:\\/\\/[^\\s\"']*mapsly\\.com[^\\s\"']*/gi, '[REDACTED_MAPSLY_URL]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst ctx = $('Route Dispatch').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\nreturn {\n  json: {\n    ...ctx,\n    slackMessage: { blockCount: ctx.slackMessage.blocks.length },\n    dispatchResult: { channel: 'slack', simulated: false, mode: 'live', ok: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300) },\n  },\n};\n"
+      },
+      "id": "f3fd0ac5-8153-55cd-9e9e-9c89a909a821",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Dispatch (Dry Run)          Mode: Run Once for Each Item\n// No network call. Records what would have been sent, and why not.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst result = { simulated: true, mode: item.delivery || 'none' };\nif (item.kind === 'connecteam_request') {\n  result.channel = 'connecteam';\n  result.shiftCount = item.request.body.length;\n  result.wouldPublish = item.request.body.some((s) => s.isPublished);\n  result.note = item.delivery === 'not_configured' ? 'CONNECTEAM_API_TOKEN or CONNECTEAM_SCHEDULER_ID missing: shifts not created' : 'dry run: shifts built, not created';\n} else if (item.kind === 'slack_summary') {\n  result.channel = 'slack';\n  result.blockCount = item.slackMessage.blocks.length;\n  result.note = item.delivery === 'not_configured' ? 'SLACK_WEBHOOK_URL missing: summary not posted' : 'dry run: Block Kit built, not posted (paste blocks into Block Kit Builder)';\n} else {\n  result.channel = null;\n  result.note = item.kind === 'route_audit' ? `no dispatch needed (${item.dispatchAction})` : 'nothing to send';\n}\nreturn { json: { ...item, dispatchResult: result } };\n"
+      },
+      "id": "bf173880-2d0b-503d-81c8-8e7d15aae0a9",
+      "name": "Simulate Dispatch (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                         Mode: Run Once for Each Item\n// One redacted audit record per dispatch item. Stores IDs, counts and\n// timings, never addresses, coordinates or customer details.\n// Written to stdout and a static-data ring buffer (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'MAPSLY_API_KEY', 'MAPSLY_GEO_ENDPOINT_URL', 'MAPSLY_MATRIX_ENDPOINT_URL', 'CONNECTEAM_API_TOKEN', 'SLACK_WEBHOOK_URL', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url|endpoint[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/https?:\\/\\/[^\\s\"']*mapsly\\.com[^\\s\"']*/gi, '[REDACTED_MAPSLY_URL]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 300));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\n\nconst item = $json;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  trigger: item.run ? item.run.trigger : null,\n  mode: item.run ? item.run.mode : null,\n  planDate: item.planDate || (item.run ? item.run.planDate : null),\n  kind: item.kind || null,\n  rejectReason: item.kind === 'rejected' && item.run ? item.run.rejectReason : null,\n  reason: item.reason || null,\n  severity: item.severity || null,\n  tech: item.tech ? { techId: item.tech.techId, connecteamUserId: item.tech.connecteamUserId } : null,\n  dispatchAction: item.dispatchAction || null,\n  routeTotals: item.kind !== 'slack_summary' && item.totals ? item.totals : null,\n  planTotals: item.kind === 'slack_summary' && item.totals ? item.totals : null,\n  unassigned: item.unassignedCount != null ? { count: item.unassignedCount, reasons: [...new Set(item.unassignedReasons || [])] } : null,\n  alerts: item.alerts ? item.alerts.map((a) => ({ severity: a.severity, code: a.code })) : null,\n  optimizer: item.optimizer || null,\n  matrix: item.matrix || null,\n  geocode: item.geocode || null,\n  delivery: item.delivery || null,\n  dispatchResult: item.dispatchResult || null,\n});\n\nif (LOG_TO_STDOUT) {\n  try { console.log(`[hs-route-optimizer] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ }\n}\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.hsRouteOptimizerAudit)) store.hsRouteOptimizerAudit = [];\n    store.hsRouteOptimizerAudit.push(record);\n    if (store.hsRouteOptimizerAudit.length > RING_SIZE) store.hsRouteOptimizerAudit.splice(0, store.hsRouteOptimizerAudit.length - RING_SIZE);\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\nreturn { json: record };\n"
+      },
+      "id": "206c83e8-04ed-500b-8a63-14edd86808ce",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        300
+      ],
+      "notes": "IDs, counts and timings only. stdout + ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "62e3ac1e-e095-5491-a37b-4cb13f242304",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        760
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'MAPSLY_API_KEY', 'MAPSLY_GEO_ENDPOINT_URL', 'MAPSLY_MATRIX_ENDPOINT_URL', 'CONNECTEAM_API_TOKEN', 'SLACK_WEBHOOK_URL', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url|endpoint[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/https?:\\/\\/[^\\s\"']*mapsly\\.com[^\\s\"']*/gi, '[REDACTED_MAPSLY_URL]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'hs_route_optimizer_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[hs-route-optimizer:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Route optimizer execution failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Route optimizer execution failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · routes for this run were not dispatched` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "7899cc0f-9d7f-5c9c-ba8e-22c4d4a20924",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f66e3c95-88fc-504b-aee1-8b3747ccbda4",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f153efe5-34f4-56fc-af1d-3f94e42fbf93",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "3fb00100-e2de-524e-83ef-b47975fa5f52",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        700
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-hubspot-mapsly-territory-route-optimizer\nField dispatch planner: HubSpot → Mapsly → routes → Connecteam/Slack. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No HubSpot, Mapsly, Connecteam or Slack calls until both are `false`.\n\n**Stage 1** Execute the *HubSpot Site Visit Webhook* trigger (pinned fictional fixtures).\n**Stage 2** `SANDBOX_MODE=false`: real HubSpot + Mapsly, dispatch simulated.\n**Stage 3** `DRY_RUN=false`: Connecteam drafts + Slack summary.\n\nConnecteam shifts are **unpublished drafts** unless `CONNECTEAM_PUBLISH_SHIFTS=true`. See README.md.",
+        "height": 320,
+        "width": 680,
+        "color": 4
+      },
+      "id": "168f1729-e65a-5fe8-80e5-cacf158bde17",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Mapsly custom API endpoints\nMapsly's public record API syncs data; geocoding, territory lookup and drive times run inside Mapsly automation. Expose two sync **API endpoints** in Mapsly (contracts in README §5) and paste their URLs into `MAPSLY_GEO_ENDPOINT_URL` / `MAPSLY_MATRIX_ENDPOINT_URL`. Treat both URLs as secrets.",
+        "height": 170,
+        "width": 560,
+        "color": 3
+      },
+      "id": "150916f8-0952-5924-97f2-00a8fbea26d4",
+      "name": "Sticky: Mapsly",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or request options. Tokens, Mapsly/Slack URLs and emails are redacted.",
+        "height": 90,
+        "width": 560,
+        "color": 2
+      },
+      "id": "74fe2f97-af67-5a02-abc3-eadc8ada1255",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        640
+      ]
+    }
+  ],
+  "connections": {
+    "HubSpot Site Visit Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context & Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nightly Plan for Tomorrow": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context & Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Context & Authenticate": {
+      "main": [
+        [
+          {
+            "node": "Request Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Sandbox Visits",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Scheduled Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sandbox Visits": {
+      "main": [
+        [
+          {
+            "node": "Normalize Visits & Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Scheduled Deals": {
+      "main": [
+        [
+          {
+            "node": "Search Scheduled Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Scheduled Tickets": {
+      "main": [
+        [
+          {
+            "node": "Collect HubSpot Visits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect HubSpot Visits": {
+      "main": [
+        [
+          {
+            "node": "Normalize Visits & Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Visits & Roster": {
+      "main": [
+        [
+          {
+            "node": "Visits to Plan?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Visits to Plan?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Geocoding?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Dispatch Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Geocoding?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Mapsly Geocode & Territory",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mapsly Geocode & Territory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Mapsly Geocode & Territory": {
+      "main": [
+        [
+          {
+            "node": "Cluster Stops by Proximity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mapsly Geocode & Territory": {
+      "main": [
+        [
+          {
+            "node": "Cluster Stops by Proximity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cluster Stops by Proximity": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Matrix?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Matrix?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Mapsly Distance Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mapsly Distance Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Mapsly Distance Matrix": {
+      "main": [
+        [
+          {
+            "node": "Route & Schedule Optimization Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mapsly Distance Matrix": {
+      "main": [
+        [
+          {
+            "node": "Route & Schedule Optimization Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route & Schedule Optimization Engine": {
+      "main": [
+        [
+          {
+            "node": "Build Dispatch Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dispatch Payloads": {
+      "main": [
+        [
+          {
+            "node": "Route Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Dispatch": {
+      "main": [
+        [
+          {
+            "node": "Create Connecteam Shifts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post Slack Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Dispatch (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Connecteam Shifts": {
+      "main": [
+        [
+          {
+            "node": "Record Connecteam Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Connecteam Result": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Summary": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Dispatch (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "HubSpot Site Visit Webhook": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-site-visit-scheduled",
+          "executionMode": "test",
+          "body": {
+            "objectType": "DEAL",
+            "objectId": 80000004,
+            "planDate": "SANDBOX_TOMORROW",
+            "properties": {
+              "site_visit_date": "SANDBOX_TOMORROW",
+              "site_visit_status": "scheduled"
+            }
+          },
+          "sandboxFixtures": {
+            "fixtureSet": "fictional-field-ops-v1",
+            "note": "All names, streets, IDs and coordinates are fictional or synthetic.",
+            "visits": [
+              {
+                "objectType": "deal",
+                "id": "80000001",
+                "properties": {
+                  "dealname": "HVAC tune-up · Larkspur Bakery",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "12 Fixture Lane",
+                  "site_visit_city": "North Quarter",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "hvac",
+                  "site_visit_window_start": "09:00",
+                  "site_visit_window_end": "12:00",
+                  "site_visit_priority": "high"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000002",
+                "properties": {
+                  "dealname": "Panel upgrade · Quarry Loft",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "48 Sample Street",
+                  "site_visit_city": "North Quarter",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "90",
+                  "site_visit_required_skills": "electrical",
+                  "site_visit_window_start": "10:00",
+                  "site_visit_window_end": "15:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "ticket",
+                "id": "80000003",
+                "properties": {
+                  "subject": "No cooling · Birchway Clinic",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "7 Placeholder Road",
+                  "site_visit_city": "Birchway",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "45",
+                  "site_visit_required_skills": "hvac",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "11:00",
+                  "site_visit_priority": "high"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000004",
+                "properties": {
+                  "dealname": "EV charger install · Fernhill Homes",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "301 Demo Avenue",
+                  "site_visit_city": "Fernhill",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "120",
+                  "site_visit_required_skills": "electrical",
+                  "site_visit_window_start": "12:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000005",
+                "properties": {
+                  "dealname": "Water heater swap · Saltmarsh Cafe",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "90 Example Way",
+                  "site_visit_city": "South Harbour",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "90",
+                  "site_visit_required_skills": "plumbing",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "12:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "ticket",
+                "id": "80000006",
+                "properties": {
+                  "subject": "Leak inspection · Harbor Row Apts",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "5 Mock Court",
+                  "site_visit_city": "South Harbour",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "plumbing",
+                  "site_visit_window_start": "13:00",
+                  "site_visit_window_end": "16:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000007",
+                "properties": {
+                  "dealname": "Heat pump service · Copperline Gym",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "220 Fixture Boulevard",
+                  "site_visit_city": "Copperline",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "hvac",
+                  "site_visit_window_start": "09:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000008",
+                "properties": {
+                  "dealname": "Solar inverter check · Southgate Depot",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "14 Synthetic Drive",
+                  "site_visit_city": "Southgate",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "75",
+                  "site_visit_required_skills": "solar",
+                  "site_visit_window_start": "09:00",
+                  "site_visit_window_end": "16:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "ticket",
+                "id": "80000009",
+                "properties": {
+                  "subject": "Breaker trips · Westfield Studio",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "63 Test Terrace",
+                  "site_visit_city": "Westfield",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "electrical",
+                  "site_visit_window_start": "10:00",
+                  "site_visit_window_end": "14:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000010",
+                "properties": {
+                  "dealname": "Backflow test · Cedar Ridge School",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "1 Sample Plaza",
+                  "site_visit_city": "Cedar Ridge",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "45",
+                  "site_visit_required_skills": "plumbing",
+                  "site_visit_window_start": "09:00",
+                  "site_visit_window_end": "15:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000011",
+                "properties": {
+                  "dealname": "Roof leak · Old Mill Barn",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "77 Placeholder Pike",
+                  "site_visit_city": "Westfield",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "120",
+                  "site_visit_required_skills": "roofing",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "ticket",
+                "id": "80000012",
+                "properties": {
+                  "subject": "Thermostat reset · Unit 4B",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "Unit 4B",
+                  "site_visit_city": "Fixture Valley",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "30",
+                  "site_visit_required_skills": "hvac",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "normal"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000013",
+                "properties": {
+                  "dealname": "Pre-dawn generator test · Riverbend Plant",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "400 Demo Works Road",
+                  "site_visit_city": "Riverbend",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "electrical",
+                  "site_visit_window_start": "06:00",
+                  "site_visit_window_end": "07:00",
+                  "site_visit_priority": "high"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000014",
+                "properties": {
+                  "dealname": "Annual inspection · Pinecrest Office",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "scheduled",
+                  "site_visit_street": "9 Example Square",
+                  "site_visit_city": "Pinecrest",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "low",
+                  "site_visit_latitude": "30.35",
+                  "site_visit_longitude": "-97.76"
+                }
+              },
+              {
+                "objectType": "deal",
+                "id": "80000015",
+                "properties": {
+                  "dealname": "Cancelled visit · Maple Annex",
+                  "site_visit_date": "SANDBOX_TOMORROW",
+                  "site_visit_status": "cancelled",
+                  "site_visit_street": "3 Mock Mews",
+                  "site_visit_city": "Maple",
+                  "site_visit_state": "FV",
+                  "site_visit_postal_code": "00000",
+                  "site_visit_country": "Fixtureland",
+                  "site_visit_duration_minutes": "60",
+                  "site_visit_required_skills": "hvac",
+                  "site_visit_window_start": "08:00",
+                  "site_visit_window_end": "17:00",
+                  "site_visit_priority": "normal"
+                }
+              }
+            ],
+            "geocodes": {
+              "deal:80000001": {
+                "lat": 30.44,
+                "lng": -97.72,
+                "matchQuality": "rooftop",
+                "formattedAddress": "12 Fixture Lane, North Quarter, Fixtureland",
+                "territories": [
+                  {
+                    "id": "north",
+                    "name": "North"
+                  }
+                ]
+              },
+              "deal:80000002": {
+                "lat": 30.41,
+                "lng": -97.69,
+                "matchQuality": "street",
+                "formattedAddress": "48 Sample Street, North Quarter, Fixtureland",
+                "territories": [
+                  {
+                    "id": "north",
+                    "name": "North"
+                  }
+                ]
+              },
+              "ticket:80000003": {
+                "lat": 30.47,
+                "lng": -97.75,
+                "matchQuality": "rooftop",
+                "formattedAddress": "7 Placeholder Road, Birchway, Fixtureland",
+                "territories": [
+                  {
+                    "id": "north",
+                    "name": "North"
+                  }
+                ]
+              },
+              "deal:80000004": {
+                "lat": 30.39,
+                "lng": -97.73,
+                "matchQuality": "street",
+                "formattedAddress": "301 Demo Avenue, Fernhill, Fixtureland",
+                "territories": [
+                  {
+                    "id": "north",
+                    "name": "North"
+                  }
+                ]
+              },
+              "deal:80000005": {
+                "lat": 30.21,
+                "lng": -97.77,
+                "matchQuality": "street",
+                "formattedAddress": "90 Example Way, South Harbour, Fixtureland",
+                "territories": [
+                  {
+                    "id": "south",
+                    "name": "South"
+                  }
+                ]
+              },
+              "ticket:80000006": {
+                "lat": 30.18,
+                "lng": -97.73,
+                "matchQuality": "street",
+                "formattedAddress": "5 Mock Court, South Harbour, Fixtureland",
+                "territories": [
+                  {
+                    "id": "south",
+                    "name": "South"
+                  }
+                ]
+              },
+              "deal:80000007": {
+                "lat": 30.23,
+                "lng": -97.7,
+                "matchQuality": "street",
+                "formattedAddress": "220 Fixture Boulevard, Copperline, Fixtureland",
+                "territories": [
+                  {
+                    "id": "south",
+                    "name": "South"
+                  }
+                ]
+              },
+              "deal:80000008": {
+                "lat": 30.19,
+                "lng": -97.79,
+                "matchQuality": "street",
+                "formattedAddress": "14 Synthetic Drive, Southgate, Fixtureland",
+                "territories": [
+                  {
+                    "id": "south",
+                    "name": "South"
+                  }
+                ]
+              },
+              "ticket:80000009": {
+                "lat": 30.31,
+                "lng": -97.86,
+                "matchQuality": "street",
+                "formattedAddress": "63 Test Terrace, Westfield, Fixtureland",
+                "territories": [
+                  {
+                    "id": "west",
+                    "name": "West"
+                  }
+                ]
+              },
+              "deal:80000010": {
+                "lat": 30.29,
+                "lng": -97.9,
+                "matchQuality": "street",
+                "formattedAddress": "1 Sample Plaza, Cedar Ridge, Fixtureland",
+                "territories": [
+                  {
+                    "id": "west",
+                    "name": "West"
+                  }
+                ]
+              },
+              "deal:80000011": {
+                "lat": 30.33,
+                "lng": -97.92,
+                "matchQuality": "street",
+                "formattedAddress": "77 Placeholder Pike, Westfield, Fixtureland",
+                "territories": [
+                  {
+                    "id": "west",
+                    "name": "West"
+                  }
+                ]
+              },
+              "ticket:80000012": {
+                "lat": 30.3,
+                "lng": -97.75,
+                "matchQuality": "city",
+                "formattedAddress": "Fixture Valley",
+                "territories": []
+              },
+              "deal:80000013": {
+                "lat": 30.5,
+                "lng": -97.8,
+                "matchQuality": "street",
+                "formattedAddress": "400 Demo Works Road, Riverbend, Fixtureland",
+                "territories": [
+                  {
+                    "id": "north",
+                    "name": "North"
+                  }
+                ]
+              },
+              "deal:80000014": {
+                "lat": 30.35,
+                "lng": -97.76,
+                "matchQuality": "street",
+                "formattedAddress": "9 Example Square, Pinecrest, Fixtureland",
+                "territories": []
+              },
+              "deal:80000015": {
+                "lat": 30.3,
+                "lng": -97.7,
+                "matchQuality": "street",
+                "formattedAddress": "3 Mock Mews, Maple, Fixtureland",
+                "territories": []
+              }
+            },
+            "technicians": [
+              {
+                "id": "tech-01",
+                "name": "Alex Rivera",
+                "skills": [
+                  "hvac",
+                  "electrical"
+                ],
+                "territories": [
+                  "north"
+                ],
+                "start": {
+                  "lat": 30.45,
+                  "lng": -97.7,
+                  "label": "North depot"
+                },
+                "shiftStart": "08:00",
+                "shiftEnd": "17:00",
+                "maxStops": 6,
+                "connecteamUserId": 9000001
+              },
+              {
+                "id": "tech-02",
+                "name": "Bea Santos",
+                "skills": [
+                  "hvac",
+                  "plumbing"
+                ],
+                "territories": [
+                  "south"
+                ],
+                "start": {
+                  "lat": 30.2,
+                  "lng": -97.75,
+                  "label": "South depot"
+                },
+                "shiftStart": "08:00",
+                "shiftEnd": "16:30",
+                "maxStops": 6,
+                "connecteamUserId": 9000002
+              },
+              {
+                "id": "tech-03",
+                "name": "Chris Okafor",
+                "skills": [
+                  "electrical",
+                  "solar"
+                ],
+                "territories": [
+                  "north",
+                  "west"
+                ],
+                "start": {
+                  "lat": 30.33,
+                  "lng": -97.88,
+                  "label": "West depot"
+                },
+                "shiftStart": "09:00",
+                "shiftEnd": "18:00",
+                "maxStops": 5,
+                "connecteamUserId": 9000003
+              },
+              {
+                "id": "tech-04",
+                "name": "Dana Lee",
+                "skills": [
+                  "plumbing"
+                ],
+                "territories": [
+                  "south",
+                  "west"
+                ],
+                "start": {
+                  "lat": 30.25,
+                  "lng": -97.85,
+                  "label": "Southwest depot"
+                },
+                "shiftStart": "07:30",
+                "shiftEnd": "15:30",
+                "maxStops": 5
+              }
+            ],
+            "priorDispatch": [
+              {
+                "techId": "tech-02",
+                "fingerprint": "deal:80000005@08:20",
+                "shiftIds": [
+                  "fixture-shift-0001"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
