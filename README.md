@@ -44,6 +44,8 @@ This workflow automates that planning step:
 
 ## 2. Architecture
 
+![Workflow Overview](./workflow-overview.png)
+
 ```mermaid
 flowchart TD
     T1["HubSpot Site Visit Webhook<br/>deal/ticket scheduled · pinned fixtures"] --> A
